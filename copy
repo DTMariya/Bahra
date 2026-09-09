@@ -1,12 +1,1 @@
-$ip = '192.168.104.51'; $port = 1701
-$c = New-Object Net.Sockets.TcpClient
-try { $c.Connect($ip, $port) } catch { "CANNOT CONNECT to ${ip}:${port} - $($_.Exception.Message)"; return }
-"connected to ${ip}:${port} - listening 3 seconds, sending nothing ..."
-$s = $c.GetStream(); Start-Sleep -Seconds 3
-$out = ''; $buf = New-Object byte[] 8192
-while ($s.DataAvailable) { $n = $s.Read($buf, 0, $buf.Length); $out += [Text.Encoding]::ASCII.GetString($buf, 0, $n) }
-$c.Close()
-$lines = @($out -split "`r?`n" | Where-Object { $_.Trim() })
-if ($lines.Count -ge 3) { "STREAM -- $($lines.Count) lines arrived unprompted. Copy these:"; $lines | Select-Object -First 8 }
-elseif ($lines.Count -ge 1) { "SHARED DATA SERVER -- only a greeting, then silence: '$($lines[0])'" }
-else { "SHARED DATA SERVER -- silent. It waits to be asked." }
+$ip='192.168.104.51'; $port=1701; $e=[Text.Encoding]::ASCII; $c=New-Object Net.Sockets.TcpClient; $c.Connect($ip,$port); $s=$c.GetStream(); $s.ReadTimeout=5000; function Say($t){$b=$e.GetBytes("$t`r`n"); $s.Write($b,0,$b.Length); $s.Flush(); Start-Sleep -Milliseconds 500; $o=""; $f=New-Object byte[] 4096; while($s.DataAvailable){$n=$s.Read($f,0,$f.Length); $o+=$e.GetString($f,0,$n)}; $o.Trim()}; "user -> $(Say 'user admin')"; "system -> $(Say 'system')"; "read -> $(Say 'read wt0101 wt0102 wt0103 wx0131')"; Say 'quit' | Out-Null; $c.Close()
