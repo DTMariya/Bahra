@@ -1,1 +1,9 @@
-$ip='192.168.104.51'; $port=1701; $e=[Text.Encoding]::ASCII; $c=New-Object Net.Sockets.TcpClient; $c.Connect($ip,$port); $s=$c.GetStream(); $s.ReadTimeout=5000; function Say($t){$b=$e.GetBytes("$t`r`n"); $s.Write($b,0,$b.Length); $s.Flush(); Start-Sleep -Milliseconds 500; $o=""; $f=New-Object byte[] 4096; while($s.DataAvailable){$n=$s.Read($f,0,$f.Length); $o+=$e.GetString($f,0,$n)}; $o.Trim()}; "user -> $(Say 'user admin')"; "system -> $(Say 'system')"; "read -> $(Say 'read wt0101 wt0102 wt0103 wx0131')"; Say 'quit' | Out-Null; $c.Close()
+# 1. One dry run first - 10 minutes, watch a real truck, post nothing
+.\Start-WeighbridgeAgent.ps1 -DryRun -RunForSeconds 600
+
+# 2. Then start it properly, detached so closing the window doesn't kill it
+Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass',
+  '-File','C:\weighbridge\Start-WeighbridgeAgent.ps1' -WindowStyle Hidden
+
+# 3. Check on it any time
+.\Test-WeighbridgeAgent.ps1
