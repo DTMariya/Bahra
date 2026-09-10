@@ -1,1 +1,37 @@
-.\Watch-WeighbridgeStream.ps1 192.168.104.51 -ScanPorts
+# --- IND570 port scan: which port pushes without being asked? ---
+$ip    = '192.168.104.51'
+$ports = 1701,1702,1703,1704,1705,1710,4305,8000,8001,9000,9100,10001,23
+
+foreach ($p in $ports) {
+    $c = New-Object System.Net.Sockets.TcpClient
+    try {
+        $ar = $c.BeginConnect($ip, $p, $null, $null)
+        if (-not $ar.AsyncWaitHandle.WaitOne(1500)) { throw 'timeout' }
+        $c.EndConnect($ar)
+    } catch {
+        Write-Host ("  {0,-6} closed" -f $p) -ForegroundColor DarkGray
+        $c.Close(); continue
+    }
+
+    $s    = $c.GetStream()
+    $buf  = New-Object byte[] 4096
+    $text = ''
+    $sw   = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalMilliseconds -lt 2000) {
+        if ($s.DataAvailable) {
+            $n = $s.Read($buf, 0, $buf.Length)
+            if ($n -gt 0) { $text += [Text.Encoding]::ASCII.GetString($buf, 0, $n) }
+        } else { Start-Sleep -Milliseconds 5 }
+    }
+    $c.Close()
+
+    $lines = @($text -split "[\r\n]+" | Where-Object { $_ -ne '' })
+
+    if ($lines.Count -eq 0) {
+        Write-Host ("  {0,-6} OPEN, silent      -- request/response, no greeting" -f $p) -ForegroundColor Yellow
+    } elseif ($lines.Count -le 2) {
+        Write-Host ("  {0,-6} OPEN, greeting    -- Shared Data Server. Got: '{1}'" -f $p, $lines[0]) -ForegroundColor Yellow
+    } else {
+        Write-Host ("  {0,-6} OPEN, STREAMING   -- {1} lines in 2s. First: '{2}'" -f $p, $lines.Count, $lines[0]) -ForegroundColor Green
+    }
+}
