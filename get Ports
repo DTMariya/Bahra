@@ -1,37 +1,120 @@
-# --- IND570 port scan: which port pushes without being asked? ---
-$ip    = '192.168.104.51'
-$ports = 1701,1702,1703,1704,1705,1710,4305,8000,8001,9000,9100,10001,23
+$Terminals = @(
+    @{ Name = 'JV Scale IN';    Host = '192.168.104.51'; Gate = 832200001; Direction = 832200000 }
+    @{ Name = 'JV Scale OUT';   Host = '192.168.104.52'; Gate = 832200001; Direction = 832200001 }
+    @{ Name = 'South Gate OUT'; Host = '192.168.174.12'; Gate = 832200000; Direction = 832200001 }
+)
+$StreamPort = 8000; $SdPort = 1701; $Deadband = 100
+$SettleReads = 3; $PollMs = 300; $WeightField = 1; $OffsetHrs = 3
 
-foreach ($p in $ports) {
+function Log { param($m, $c = 'Gray') Write-Host ('{0} {1}' -f (Get-Date -f 'HH:mm:ss.fff'), $m) -ForegroundColor $c }
+function Connect-Sock { param($h, $p)
     $c = New-Object System.Net.Sockets.TcpClient
-    try {
-        $ar = $c.BeginConnect($ip, $p, $null, $null)
-        if (-not $ar.AsyncWaitHandle.WaitOne(1500)) { throw 'timeout' }
-        $c.EndConnect($ar)
-    } catch {
-        Write-Host ("  {0,-6} closed" -f $p) -ForegroundColor DarkGray
-        $c.Close(); continue
-    }
-
-    $s    = $c.GetStream()
-    $buf  = New-Object byte[] 4096
-    $text = ''
-    $sw   = [Diagnostics.Stopwatch]::StartNew()
-    while ($sw.Elapsed.TotalMilliseconds -lt 2000) {
-        if ($s.DataAvailable) {
-            $n = $s.Read($buf, 0, $buf.Length)
-            if ($n -gt 0) { $text += [Text.Encoding]::ASCII.GetString($buf, 0, $n) }
+    $a = $c.BeginConnect($h, $p, $null, $null)
+    if (-not $a.AsyncWaitHandle.WaitOne(4000)) { $c.Close(); throw 'connect timeout' }
+    $c.EndConnect($a); $c.NoDelay = $true; return $c
+}
+function Sd-Line { param($T)
+    $b = New-Object byte[] 2048; $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($T.SdBuf.IndexOf("`r`n") -lt 0) {
+        if ($sw.Elapsed.TotalMilliseconds -gt 3000) { throw 'read timeout' }
+        if ($T.SdStream.DataAvailable) {
+            $n = $T.SdStream.Read($b, 0, $b.Length); if ($n -le 0) { throw 'closed' }
+            $T.SdBuf += [Text.Encoding]::ASCII.GetString($b, 0, $n)
         } else { Start-Sleep -Milliseconds 5 }
     }
-    $c.Close()
+    $i = $T.SdBuf.IndexOf("`r`n"); $l = $T.SdBuf.Substring(0, $i); $T.SdBuf = $T.SdBuf.Substring($i + 2); return $l.TrimEnd()
+}
+function Sd-Send { param($T, $Text)
+    $b = [Text.Encoding]::ASCII.GetBytes($Text + "`r"); $T.SdStream.Write($b, 0, $b.Length); $T.SdStream.Flush()
+}
 
-    $lines = @($text -split "[\r\n]+" | Where-Object { $_ -ne '' })
+foreach ($T in $Terminals) {
+    $T.StreamClient = $null; $T.SdClient = $null; $T.StreamBuf = ''; $T.SdBuf = ''
+    $T.Primed = $false; $T.State = 'IDLE'; $T.W = 0.0; $T.Stable = 0; $T.LastW = $null
+    $T.LastPoll = [datetime]::MinValue; $T.NextRetry = [datetime]::MinValue
+}
+Log "dry run - watching $($Terminals.Count) terminal(s). Nothing will be posted." 'White'
 
-    if ($lines.Count -eq 0) {
-        Write-Host ("  {0,-6} OPEN, silent      -- request/response, no greeting" -f $p) -ForegroundColor Yellow
-    } elseif ($lines.Count -le 2) {
-        Write-Host ("  {0,-6} OPEN, greeting    -- Shared Data Server. Got: '{1}'" -f $p, $lines[0]) -ForegroundColor Yellow
-    } else {
-        Write-Host ("  {0,-6} OPEN, STREAMING   -- {1} lines in 2s. First: '{2}'" -f $p, $lines.Count, $lines[0]) -ForegroundColor Green
+try {
+  while ($true) {
+    $now = Get-Date
+    foreach ($T in $Terminals) {
+      if ($null -eq $T.StreamClient -and $now -ge $T.NextRetry) {
+        try {
+            $T.StreamClient = Connect-Sock $T.Host $StreamPort
+            $T.StreamStream = $T.StreamClient.GetStream(); $T.StreamBuf = ''; $T.Primed = $false
+            Log "$($T.Name): stream $StreamPort connected" 'Green'
+        } catch { Log "$($T.Name): $StreamPort - $($_.Exception.Message)" 'Yellow'; $T.NextRetry = $now.AddSeconds(10); $T.StreamClient = $null }
+      }
+      if ($null -eq $T.StreamClient) { continue }
+      try {
+        $b = New-Object byte[] 8192
+        while ($T.StreamStream.DataAvailable) {
+            $n = $T.StreamStream.Read($b, 0, $b.Length); if ($n -le 0) { throw 'closed' }
+            $T.StreamBuf += [Text.Encoding]::ASCII.GetString($b, 0, $n)
+        }
+        while (($i = $T.StreamBuf.IndexOfAny([char[]]@("`r", "`n"))) -ge 0) {
+            $line = $T.StreamBuf.Substring(0, $i)
+            $T.StreamBuf = $T.StreamBuf.Substring($i + 1).TrimStart(@("`r", "`n"))
+            if (-not $T.Primed) { $T.Primed = $true; continue }
+            $f = @($line.Trim() -split '\s+'); if ($f.Count -le $WeightField) { continue }
+            $v = 0.0; if ([double]::TryParse($f[$WeightField], [ref]$v)) { $T.W = $v }
+        }
+      } catch { Log "$($T.Name): stream dropped" 'Yellow'; $T.StreamClient.Close(); $T.StreamClient = $null; $T.NextRetry = $now.AddSeconds(5); continue }
+
+      if ([Math]::Abs($T.W) -lt $Deadband) {
+        if ($T.State -ne 'IDLE') { Log "$($T.Name): $($T.State) -> IDLE (deck clear)" 'Cyan'; $T.State = 'IDLE'; $T.Stable = 0; $T.LastW = $null }
+        continue
+      }
+      if ($T.State -eq 'IDLE') { Log "$($T.Name): IDLE -> OCCUPIED (weight $($T.W))" 'Cyan'; $T.State = 'OCCUPIED'; $T.Stable = 0; $T.LastW = $null }
+      if ($T.State -eq 'CAPTURED') { continue }
+
+      if ($null -eq $T.SdClient) {
+        try {
+            $T.SdClient = Connect-Sock $T.Host $SdPort; $T.SdStream = $T.SdClient.GetStream(); $T.SdBuf = ''
+            $g = Sd-Line $T; Sd-Send $T 'user admin'; $r = Sd-Line $T
+            if ($r -like '51*') { Sd-Send $T 'pass '; $r = Sd-Line $T }
+            if ($r -notlike '12*') { throw "login refused: $r" }
+            Log "$($T.Name): 1701 connected ($g)" 'Green'
+        } catch { Log "$($T.Name): 1701 - $($_.Exception.Message)" 'Yellow'; $T.SdClient = $null; continue }
+      }
+
+      if (($now - $T.LastPoll).TotalMilliseconds -lt $PollMs) { continue }
+      $T.LastPoll = $now
+      try {
+        Sd-Send $T 'read wt0101 wt0102 wt0103 wx0131 wx0133 wx0134'
+        $line = Sd-Line $T
+      } catch { Log "$($T.Name): read failed" 'Yellow'; $T.SdClient.Close(); $T.SdClient = $null; continue }
+
+      if ($line -notmatch '^00') { Log "$($T.Name): $line" 'Yellow'; continue }
+      $p = $line -split '~'; $vals = @()
+      for ($k = 1; $k -lt $p.Count; $k++) { if ($k -eq $p.Count - 1 -and $p[$k] -eq '') { break }; $vals += $p[$k].Trim() }
+      if ($vals.Count -lt 6) { continue }
+      $gross = 0.0; if (-not [double]::TryParse($vals[0], [ref]$gross)) { continue }
+      $unit = $vals[2]; $motion = $vals[3]; $over = $vals[4]; $under = $vals[5]
+      if ($over -eq '1' -or $under -eq '1') { Log "$($T.Name): over=$over under=$under - refusing" 'Yellow'; $T.Stable = 0; continue }
+
+      # wx0131: 0 = NOT moving. Never invert this.
+      if ($motion -ne '0') { $T.Stable = 0; $T.LastW = $null; continue }
+      if ($null -ne $T.LastW -and $T.LastW -eq $gross) { $T.Stable++ } else { $T.Stable = 1 }
+      $T.LastW = $gross
+      if ($T.Stable -lt $SettleReads) { continue }
+
+      $T.State = 'CAPTURED'
+      $payload = [ordered]@{
+        gate = [int]$T.Gate; direction = [int]$T.Direction; weight = $gross; unit = $unit
+        time = [datetimeoffset]::UtcNow.ToOffset([timespan]::FromHours($OffsetHrs)).ToString('yyyy-MM-ddTHH:mm:sszzz')
+        terminal = $T.Host; settled = $true
+      }
+      Log "$($T.Name): SETTLED at $gross $unit" 'Cyan'
+      Log "  WOULD POST: $($payload | ConvertTo-Json -Compress)" 'Magenta'
     }
+    Start-Sleep -Milliseconds 50
+  }
+} finally {
+  foreach ($T in $Terminals) {
+    if ($T.SdClient) { try { Sd-Send $T 'quit' } catch {}; $T.SdClient.Close() }
+    if ($T.StreamClient) { $T.StreamClient.Close() }
+  }
+  Log 'stopped, sockets closed' 'White'
 }
