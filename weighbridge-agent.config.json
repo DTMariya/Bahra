@@ -1,0 +1,43 @@
+{
+  "_comment": "LIVE CONFIG. The sig in flowUrl IS the credential - do not commit or share this file. Regenerate the trigger URL when the PoC is over.",
+
+  "flowUrl": "https://525e9f940608eb708017284705e078.d0.environment.api.powerplatform.com/powerautomate/automations/direct/cu/03/workflows/efeab9cc053d4bf49212b0e4f999a96a/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=aLE3EghP2oEvL6GLFXHES2FXPLWBHj1ZNirQO6_dNQ4",
+
+  "streamPort": 8000,
+  "sharedDataPort": 1701,
+  "user": "admin",
+  "password": "",
+
+  "_emptyDeadband": "Confirmed non-zero decks on these bridges, and 1701 read -20 on an empty one. 100 kg is the starting point; raise it if the dry run shows OCCUPIED with no truck present.",
+  "emptyDeadband": 100,
+
+  "settleReads": 3,
+  "pollIntervalMs": 300,
+  "maxWeighingSeconds": 300,
+
+  "_stuckCapturedMinutes": "Shout if a deck stays latched this long without clearing. A bridge that never reads empty captures once and then goes silent, which looks exactly like a quiet day.",
+  "stuckCapturedMinutes": 30,
+
+  "utcOffsetHours": 3,
+
+  "_streamWeightField": "Field 1 of '10  22940  00'. Confirmed on real hardware 2026-09-10 - it tracked 22940, 37240 and 45440 on JV Scale IN.",
+  "streamWeightField": 1,
+
+  "reconnectMinMs": 2000,
+  "reconnectMaxMs": 60000,
+  "queueRetrySeconds": 60,
+  "heartbeatSeconds": 15,
+  "queueWarnDepth": 5,
+  "logRetentionDays": 30,
+  "logPath": "logs",
+  "queuePath": "queue",
+
+  "_terminals": "crce2_gate: 832200001 = jv scale, 832200000 = south. crce2_bounded: 832200000 = In, 832200001 = Out. The two columns are ordered OPPOSITE to each other.",
+  "terminals": [
+    { "name": "JV Scale IN",    "host": "192.168.104.51", "gate": 832200001, "direction": 832200000 },
+    { "name": "JV Scale OUT",   "host": "192.168.104.52", "gate": 832200001, "direction": 832200001 },
+    { "name": "South Gate OUT", "host": "192.168.174.12", "gate": 832200000, "direction": 832200001 }
+  ],
+
+  "_south_gate_in": "192.168.174.11 omitted - both ports closed and no ping response on 2026-09-10. Add back once Bahra confirms it is powered and networked: { \"name\": \"South Gate IN\", \"host\": \"192.168.174.11\", \"gate\": 832200000, \"direction\": 832200000 }"
+}
