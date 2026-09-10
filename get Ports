@@ -31,7 +31,7 @@ function Sd-Send { param($T, $Text)
 foreach ($T in $Terminals) {
     $T.StreamClient = $null; $T.SdClient = $null; $T.StreamBuf = ''; $T.SdBuf = ''
     $T.Primed = $false; $T.State = 'IDLE'; $T.W = 0.0; $T.Stable = 0; $T.LastW = $null
-    $T.LastPoll = [datetime]::MinValue; $T.NextRetry = [datetime]::MinValue
+    $T.LastPoll = [datetime]::MinValue; $T.NextRetry = [datetime]::MinValue; $T.NextSdRetry = [datetime]::MinValue
 }
 Log "dry run - watching $($Terminals.Count) terminal(s). Nothing will be posted." 'White'
 
@@ -69,22 +69,45 @@ try {
       if ($T.State -eq 'IDLE') { Log "$($T.Name): IDLE -> OCCUPIED (weight $($T.W))" 'Cyan'; $T.State = 'OCCUPIED'; $T.Stable = 0; $T.LastW = $null }
       if ($T.State -eq 'CAPTURED') { continue }
 
-      if ($null -eq $T.SdClient) {
+      if ($null -eq $T.SdClient -and $now -ge $T.NextSdRetry) {
         try {
             $T.SdClient = Connect-Sock $T.Host $SdPort; $T.SdStream = $T.SdClient.GetStream(); $T.SdBuf = ''
-            $g = Sd-Line $T; Sd-Send $T 'user admin'; $r = Sd-Line $T
-            if ($r -like '51*') { Sd-Send $T 'pass '; $r = Sd-Line $T }
-            if ($r -notlike '12*') { throw "login refused: $r" }
+            Start-Sleep -Milliseconds 300
+            $g = ''
+            while ($T.SdStream.DataAvailable -or $T.SdBuf.IndexOf("`r`n") -ge 0) {
+                $l = (Sd-Line $T).Trim(); if ($l -ne '') { $g = $l }
+            }
+            Sd-Send $T 'user admin'
+            $ok = $false
+            for ($z = 0; $z -lt 6; $z++) {
+                $r = (Sd-Line $T).Trim()
+                if ($r -eq '') { continue }
+                if ($r -like '12*') { $ok = $true; break }
+                if ($r -like '51*') { Sd-Send $T 'pass '; continue }
+                if ($r -like '53*') { $g = $r; continue }
+                throw "login refused: $r"
+            }
+            if (-not $ok) { throw 'no status code after 6 lines' }
             Log "$($T.Name): 1701 connected ($g)" 'Green'
-        } catch { Log "$($T.Name): 1701 - $($_.Exception.Message)" 'Yellow'; $T.SdClient = $null; continue }
+        } catch {
+            Log "$($T.Name): 1701 - $($_.Exception.Message)" 'Yellow'
+            if ($T.SdClient) { try { $T.SdClient.Close() } catch {} }
+            $T.SdClient = $null; $T.NextSdRetry = $now.AddSeconds(10)
+            continue
+        }
       }
+      if ($null -eq $T.SdClient) { continue }
 
       if (($now - $T.LastPoll).TotalMilliseconds -lt $PollMs) { continue }
       $T.LastPoll = $now
       try {
         Sd-Send $T 'read wt0101 wt0102 wt0103 wx0131 wx0133 wx0134'
         $line = Sd-Line $T
-      } catch { Log "$($T.Name): read failed" 'Yellow'; $T.SdClient.Close(); $T.SdClient = $null; continue }
+      } catch {
+          Log "$($T.Name): read failed - $($_.Exception.Message)" 'Yellow'
+          try { $T.SdClient.Close() } catch {}
+          $T.SdClient = $null; $T.NextSdRetry = $now.AddSeconds(10); continue
+      }
 
       if ($line -notmatch '^00') { Log "$($T.Name): $line" 'Yellow'; continue }
       $p = $line -split '~'; $vals = @()
