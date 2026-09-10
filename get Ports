@@ -1,12 +1,23 @@
+# ============================ WEIGHBRIDGE AGENT - DRY RUN ============================
+# Watches port 8000 for a truck, polls 1701 until it stops moving, prints what it WOULD
+# send to Power Automate. Posts nothing. Read-only: user / pass / read / quit.
+# Ctrl+C to stop.
+
 $Terminals = @(
     @{ Name = 'JV Scale IN';    Host = '192.168.104.51'; Gate = 832200001; Direction = 832200000 }
     @{ Name = 'JV Scale OUT';   Host = '192.168.104.52'; Gate = 832200001; Direction = 832200001 }
     @{ Name = 'South Gate OUT'; Host = '192.168.174.12'; Gate = 832200000; Direction = 832200001 }
 )
-$StreamPort = 8000; $SdPort = 1701; $Deadband = 100
-$SettleReads = 3; $PollMs = 300; $WeightField = 1; $OffsetHrs = 3
+$StreamPort = 8000      # continuous output
+$SdPort     = 1701      # Shared Data Server
+$Deadband   = 100       # below this the deck counts as empty
+$SettleReads= 3         # consecutive "not moving" reads with an unchanged weight
+$PollMs     = 300
+$WeightField= 1         # 0-based field in '10  22940  00'
+$OffsetHrs  = 3         # plant local time
 
 function Log { param($m, $c = 'Gray') Write-Host ('{0} {1}' -f (Get-Date -f 'HH:mm:ss.fff'), $m) -ForegroundColor $c }
+
 function Connect-Sock { param($h, $p)
     $c = New-Object System.Net.Sockets.TcpClient
     $a = $c.BeginConnect($h, $p, $null, $null)
@@ -22,9 +33,13 @@ function Sd-Line { param($T)
             $T.SdBuf += [Text.Encoding]::ASCII.GetString($b, 0, $n)
         } else { Start-Sleep -Milliseconds 5 }
     }
-    $i = $T.SdBuf.IndexOf("`r`n"); $l = $T.SdBuf.Substring(0, $i); $T.SdBuf = $T.SdBuf.Substring($i + 2); return $l.TrimEnd()
+    $i = $T.SdBuf.IndexOf("`r`n"); $l = $T.SdBuf.Substring(0, $i); $T.SdBuf = $T.SdBuf.Substring($i + 2)
+    # Strip the terminal's '>' prompt. It arrives as its own line just after the greeting, and can
+    # also come glued to the front of the next reply. No real reply starts with '>'.
+    return ($l -replace '^[\s>]+', '').TrimEnd()
 }
 function Sd-Send { param($T, $Text)
+    # CR alone: the terminal treats a trailing LF as a second, empty command.
     $b = [Text.Encoding]::ASCII.GetBytes($Text + "`r"); $T.SdStream.Write($b, 0, $b.Length); $T.SdStream.Flush()
 }
 
@@ -33,12 +48,14 @@ foreach ($T in $Terminals) {
     $T.Primed = $false; $T.State = 'IDLE'; $T.W = 0.0; $T.Stable = 0; $T.LastW = $null
     $T.LastPoll = [datetime]::MinValue; $T.NextRetry = [datetime]::MinValue; $T.NextSdRetry = [datetime]::MinValue
 }
+
 Log "dry run - watching $($Terminals.Count) terminal(s). Nothing will be posted." 'White'
 
 try {
   while ($true) {
     $now = Get-Date
     foreach ($T in $Terminals) {
+
       if ($null -eq $T.StreamClient -and $now -ge $T.NextRetry) {
         try {
             $T.StreamClient = Connect-Sock $T.Host $StreamPort
@@ -47,6 +64,7 @@ try {
         } catch { Log "$($T.Name): $StreamPort - $($_.Exception.Message)" 'Yellow'; $T.NextRetry = $now.AddSeconds(10); $T.StreamClient = $null }
       }
       if ($null -eq $T.StreamClient) { continue }
+
       try {
         $b = New-Object byte[] 8192
         while ($T.StreamStream.DataAvailable) {
@@ -56,7 +74,7 @@ try {
         while (($i = $T.StreamBuf.IndexOfAny([char[]]@("`r", "`n"))) -ge 0) {
             $line = $T.StreamBuf.Substring(0, $i)
             $T.StreamBuf = $T.StreamBuf.Substring($i + 1).TrimStart(@("`r", "`n"))
-            if (-not $T.Primed) { $T.Primed = $true; continue }
+            if (-not $T.Primed) { $T.Primed = $true; continue }   # joined mid-frame; discard
             $f = @($line.Trim() -split '\s+'); if ($f.Count -le $WeightField) { continue }
             $v = 0.0; if ([double]::TryParse($f[$WeightField], [ref]$v)) { $T.W = $v }
         }
@@ -72,6 +90,7 @@ try {
       if ($null -eq $T.SdClient -and $now -ge $T.NextSdRetry) {
         try {
             $T.SdClient = Connect-Sock $T.Host $SdPort; $T.SdStream = $T.SdClient.GetStream(); $T.SdBuf = ''
+            # Do NOT assume the greeting is one clean line - real hardware leads with a blank one.
             Start-Sleep -Milliseconds 300
             $g = ''
             while ($T.SdStream.DataAvailable -or $T.SdBuf.IndexOf("`r`n") -ge 0) {
@@ -91,7 +110,7 @@ try {
             Log "$($T.Name): 1701 connected ($g)" 'Green'
         } catch {
             Log "$($T.Name): 1701 - $($_.Exception.Message)" 'Yellow'
-            if ($T.SdClient) { try { $T.SdClient.Close() } catch {} }
+            if ($T.SdClient) { try { $T.SdClient.Close() } catch {} }   # never leak a session
             $T.SdClient = $null; $T.NextSdRetry = $now.AddSeconds(10)
             continue
         }
@@ -100,9 +119,18 @@ try {
 
       if (($now - $T.LastPoll).TotalMilliseconds -lt $PollMs) { continue }
       $T.LastPoll = $now
+
       try {
+        # Drain the leftover '>' prompt from the previous command before asking again.
+        while ($T.SdStream.DataAvailable -or $T.SdBuf.IndexOf("`r`n") -ge 0) { [void](Sd-Line $T) }
         Sd-Send $T 'read wt0101 wt0102 wt0103 wx0131 wx0133 wx0134'
-        $line = Sd-Line $T
+        $line = ''
+        for ($y = 0; $y -lt 5; $y++) {
+            $line = Sd-Line $T
+            if ($line -eq '') { continue }
+            if ($line -match '^83') { continue }
+            break
+        }
       } catch {
           Log "$($T.Name): read failed - $($_.Exception.Message)" 'Yellow'
           try { $T.SdClient.Close() } catch {}
@@ -113,12 +141,15 @@ try {
       $p = $line -split '~'; $vals = @()
       for ($k = 1; $k -lt $p.Count; $k++) { if ($k -eq $p.Count - 1 -and $p[$k] -eq '') { break }; $vals += $p[$k].Trim() }
       if ($vals.Count -lt 6) { continue }
+
       $gross = 0.0; if (-not [double]::TryParse($vals[0], [ref]$gross)) { continue }
       $unit = $vals[2]; $motion = $vals[3]; $over = $vals[4]; $under = $vals[5]
+
       if ($over -eq '1' -or $under -eq '1') { Log "$($T.Name): over=$over under=$under - refusing" 'Yellow'; $T.Stable = 0; continue }
 
       # wx0131: 0 = NOT moving. Never invert this.
       if ($motion -ne '0') { $T.Stable = 0; $T.LastW = $null; continue }
+
       if ($null -ne $T.LastW -and $T.LastW -eq $gross) { $T.Stable++ } else { $T.Stable = 1 }
       $T.LastW = $gross
       if ($T.Stable -lt $SettleReads) { continue }
