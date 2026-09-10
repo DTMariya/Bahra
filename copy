@@ -7,3 +7,6 @@ Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass',
 
 # 3. Check on it any time
 .\Test-WeighbridgeAgent.ps1
+
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+Get-ChildItem .\*.ps1 | Unblock-File
