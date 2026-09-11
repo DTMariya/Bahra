@@ -12,13 +12,30 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 Get-ChildItem .\*.ps1 | Unblock-File
 
 
-$dir = 'C:\...\Bahara Weight Bridge'   # the folder with Start-WeighbridgeAgent.ps1 on the server
+$dir  = 'C:\weighbridge'
+$task = 'WeighbridgeAgent-24h'
 
+# 1. Remove the earlier task that points at the wrong folder
+Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
+
+# 2. Make sure the script and config are actually there
+if (-not (Test-Path "$dir\Start-WeighbridgeAgent.ps1"))       { throw "Start-WeighbridgeAgent.ps1 not found in $dir" }
+if (-not (Test-Path "$dir\weighbridge-agent.config.json"))    { throw "weighbridge-agent.config.json not found in $dir" }
+
+# 3. Create the task: run the agent for 24 hours (86400 s) as SYSTEM
 $action   = New-ScheduledTaskAction -Execute 'powershell.exe' `
               -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$dir\Start-WeighbridgeAgent.ps1`" -RunForSeconds 86400" `
               -WorkingDirectory $dir
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 25)
+Register-ScheduledTask -TaskName $task -Action $action -Settings $settings -User 'SYSTEM' -RunLevel Highest | Out-Null
 
-Register-ScheduledTask -TaskName 'WeighbridgeAgent-24h' -Action $action -Settings $settings -User 'SYSTEM' -RunLevel Highest
-Start-ScheduledTask  -TaskName 'WeighbridgeAgent-24h'
+# 4. Start it and give it time to connect to the terminals
+Start-ScheduledTask -TaskName $task
+Start-Sleep -Seconds 20
+
+# 5. Check it
+Get-ScheduledTask     -TaskName $task | Select-Object TaskName, State
+Get-ScheduledTaskInfo -TaskName $task | Select-Object LastRunTime, LastTaskResult
+& "$dir\Test-WeighbridgeAgent.ps1"
+Get-Content "$dir\logs\agent-$(Get-Date -Format yyyy-MM-dd).log" -Tail 15
 
