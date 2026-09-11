@@ -39,3 +39,11 @@ Get-ScheduledTaskInfo -TaskName $task | Select-Object LastRunTime, LastTaskResul
 & "$dir\Test-WeighbridgeAgent.ps1"
 Get-Content "$dir\logs\agent-$(Get-Date -Format yyyy-MM-dd).log" -Tail 15
 
+-----
+Get-ScheduledTaskInfo -TaskName 'WeighbridgeAgent-24h' | Select-Object LastRunTime, LastTaskResult
+Get-ChildItem C:\weighbridge\logs | Sort-Object LastWriteTime -Descending | Select-Object -First 3 Name, LastWriteTime
+
+# Run exactly what the task runs, but in this window for 15 seconds, so any error shows up
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:\weighbridge\Start-WeighbridgeAgent.ps1" -RunForSeconds 15
+
+
