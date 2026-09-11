@@ -46,4 +46,6 @@ Get-ChildItem C:\weighbridge\logs | Sort-Object LastWriteTime -Descending | Sele
 # Run exactly what the task runs, but in this window for 15 seconds, so any error shows up
 powershell -NoProfile -ExecutionPolicy Bypass -File "C:\weighbridge\Start-WeighbridgeAgent.ps1" -RunForSeconds 15
 
+----
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& 'C:\weighbridge\Start-WeighbridgeAgent.ps1' -ConfigPath 'C:\weighbridge\weighbridge-agent.config.json' -RunForSeconds 15"
 
