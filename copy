@@ -12,11 +12,13 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 Get-ChildItem .\*.ps1 | Unblock-File
 
 
-$a = New-ScheduledTaskAction -Execute 'powershell.exe' `
-     -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\weighbridge\Start-WeighbridgeAgent.ps1'
-$t = New-ScheduledTaskTrigger -AtStartup
-$s = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
-     -ExecutionTimeLimit ([TimeSpan]::Zero)
-Register-ScheduledTask -TaskName 'Weighbridge Agent' -Action $a -Trigger $t -Settings $s `
-     -User 'SYSTEM' -RunLevel Highest
-Start-ScheduledTask -TaskName 'Weighbridge Agent'
+$dir = 'C:\...\Bahara Weight Bridge'   # the folder with Start-WeighbridgeAgent.ps1 on the server
+
+$action   = New-ScheduledTaskAction -Execute 'powershell.exe' `
+              -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$dir\Start-WeighbridgeAgent.ps1`" -RunForSeconds 86400" `
+              -WorkingDirectory $dir
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 25)
+
+Register-ScheduledTask -TaskName 'WeighbridgeAgent-24h' -Action $action -Settings $settings -User 'SYSTEM' -RunLevel Highest
+Start-ScheduledTask  -TaskName 'WeighbridgeAgent-24h'
+
