@@ -49,3 +49,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "C:\weighbridge\Start-Weighb
 ----
 powershell -NoProfile -ExecutionPolicy Bypass -Command "& 'C:\weighbridge\Start-WeighbridgeAgent.ps1' -ConfigPath 'C:\weighbridge\weighbridge-agent.config.json' -RunForSeconds 15"
 
+----
+$task = 'WeighbridgeAgent-24h'
+Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
+
+$action = New-ScheduledTaskAction -Execute 'powershell.exe' -WorkingDirectory 'C:\weighbridge' `
+  -Argument "-NoProfile -ExecutionPolicy Bypass -Command `"& 'C:\weighbridge\Start-WeighbridgeAgent.ps1' -ConfigPath 'C:\weighbridge\weighbridge-agent.config.json' -RunForSeconds 86400 *> 'C:\weighbridge\task-console.log'`""
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 25)
+Register-ScheduledTask -TaskName $task -Action $action -Settings $settings -User 'SYSTEM' -RunLevel Highest | Out-Null
+
+Start-ScheduledTask -TaskName $task
+Start-Sleep -Seconds 20
+Get-ScheduledTask     -TaskName $task | Select-Object TaskName, State
+Get-ScheduledTaskInfo -TaskName $task | Select-Object LastRunTime, LastTaskResult
+Get-Content 'C:\weighbridge\task-console.log' -Tail 15
