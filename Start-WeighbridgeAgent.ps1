@@ -15,8 +15,8 @@
 
       IDLE      deck empty (|weight| < EmptyDeadband). Nothing to do.
       OCCUPIED  something on the deck. Poll 1701 every PollIntervalMs.
-      CAPTURED  wx0131 said "not moving" SettleReads times running, and the weight did not
-                change. Posted once, then latched.
+      CAPTURED  every reading for SettleSeconds stayed within SettleTolerance, and wx0131 says
+                "not moving". Posted once, then latched.
       (back to IDLE when the deck clears, which clears the latch)
 
     The latch is the point. A truck sits still for a minute while paperwork happens; without it
@@ -72,7 +72,8 @@ $SdPort           = [int](Get-Setting 'sharedDataPort' 1701)
 $SdUser           = [string](Get-Setting 'user' 'admin')
 $SdPassword       = [string](Get-Setting 'password' '')
 $EmptyDeadband    = [double](Get-Setting 'emptyDeadband' 100)
-$SettleReads      = [int](Get-Setting 'settleReads' 3)
+$SettleSeconds    = [double](Get-Setting 'settleSeconds' 30)
+$SettleTolerance  = [double](Get-Setting 'settleTolerance' 200)
 $PollIntervalMs   = [int](Get-Setting 'pollIntervalMs' 300)
 $MaxWeighingSecs  = [int](Get-Setting 'maxWeighingSeconds' 300)
 $UtcOffsetHours   = [double](Get-Setting 'utcOffsetHours' 3)
@@ -263,6 +264,7 @@ function Invoke-SdRead {
         if ($line -match '^83') { continue }        # spurious "command not recognized"
         break
     }
+    $T.LastSdReply = $line
     if ($line -notmatch '^00') { throw "read failed: '$line'" }
     $parts = $line -split '~'
     # parts[0] is the status header; values follow, trailing empty from the final '~'
@@ -316,7 +318,7 @@ function Get-StreamWeight {
         if ($fields.Count -le $StreamField) { continue }
         $raw = $fields[$StreamField]
         $parsed = 0.0
-        if ([double]::TryParse($raw, [ref]$parsed)) { $latest = $parsed }
+        if ([double]::TryParse($raw, [ref]$parsed)) { $latest = $parsed; $T.LastStreamLine = $text.Trim() }
     }
     return $latest
 }
@@ -390,12 +392,16 @@ foreach ($t in $cfg.terminals) {
 
         State = 'IDLE'
         LastStreamWeight = 0.0
-        StableCount = 0
-        LastStableWeight = $null
+        SettleSince = $null; SettleMin = 0.0; SettleMax = 0.0
         LastPollAt = [datetime]::MinValue
         OccupiedSince = $null
         CapturedAt = $null
         GaveUp = $false
+
+        # Diagnostics only -- none of these change what is sent.
+        LastStreamLine = ''; LastSdReply = ''
+        SentWeight = $null; PeakWeight = 0.0
+        SteadyWeight = $null; SteadySince = $null; WarnedWeight = $null
 
         StreamFailures = 0; SdFailures = 0
         NextStreamRetryAt = [datetime]::MinValue
@@ -431,7 +437,7 @@ $script:LastQueueDepth = -1
 
 Write-Log ("agent starting -- {0} terminal(s), stream :{1}, shared data :{2}{3}" -f `
     $terminals.Count, $StreamPort, $SdPort, $(if ($DryRun) { ', DRY RUN' } else { '' })) 'INFO' 'White'
-Write-Log "empty deadband +/-$EmptyDeadband, settle needs $SettleReads stable reads, poll every ${PollIntervalMs}ms" 'INFO' 'DarkGray'
+Write-Log "empty deadband +/-$EmptyDeadband, settle needs ${SettleSeconds}s with readings no more than $SettleTolerance apart, poll every ${PollIntervalMs}ms" 'INFO' 'DarkGray'
 Write-Log "heartbeat -> $HeartbeatPath every ${HeartbeatSecs}s, logs kept ${LogRetentionDays} days, queue alarm at $QueueWarnDepth" 'INFO' 'DarkGray'
 
 $started = Get-Date
@@ -478,14 +484,19 @@ try {
                 }
             }
 
+            # How long port 8000 has shown the same weight. Diagnostics only.
+            if ($T.SteadyWeight -ne $T.LastStreamWeight) { $T.SteadyWeight = $T.LastStreamWeight; $T.SteadySince = $now }
+
             $occupied = ([Math]::Abs($T.LastStreamWeight) -ge $EmptyDeadband)
 
             # -- IDLE ----------------------------------------------------------------------
             if (-not $occupied) {
                 if ($T.State -ne 'IDLE') {
+                    Write-Log ("$($T.Name): truck gone -- sent {0}, highest on deck {1}" -f `
+                        $(if ($null -ne $T.SentWeight) { $T.SentWeight } else { 'nothing' }), $T.PeakWeight) 'DIAG' 'DarkCyan'
+                    $T.SentWeight = $null; $T.PeakWeight = 0.0; $T.WarnedWeight = $null
                     Set-State $T 'IDLE' "deck clear ($($T.LastStreamWeight))"
-                    $T.StableCount = 0
-                    $T.LastStableWeight = $null
+                    $T.SettleSince = $null
                     $T.OccupiedSince = $null
                     $T.CapturedAt = $null
                     $T.GaveUp = $false
@@ -497,12 +508,23 @@ try {
             if ($T.State -eq 'IDLE') {
                 Set-State $T 'OCCUPIED' "weight $($T.LastStreamWeight) on deck"
                 $T.OccupiedSince = $now
-                $T.StableCount = 0
-                $T.LastStableWeight = $null
+                $T.SettleSince = $null
             }
+            if ($T.LastStreamWeight -gt $T.PeakWeight) { $T.PeakWeight = $T.LastStreamWeight }
 
             # Already sent for this truck; wait for it to leave.
             if ($T.State -eq 'CAPTURED') {
+                # Say so if the deck has since settled on a clearly different weight than the one
+                # we sent -- an early capture (truck paused part-way on) or 1701 disagreeing with
+                # the display. Logged once per steady value.
+                $steadyFor = ($now - $T.SteadySince).TotalSeconds
+                if ($null -ne $T.SentWeight -and $steadyFor -ge 3 -and $T.WarnedWeight -ne $T.SteadyWeight -and
+                    [Math]::Abs($T.SteadyWeight - $T.SentWeight) -gt $SettleTolerance) {
+                    Write-Log ("$($T.Name): MISMATCH -- sent {0} but port {1} has read {2} steadily for {3:N0}s (difference {4})" -f `
+                        $T.SentWeight, $StreamPort, $T.SteadyWeight, $steadyFor, ($T.SteadyWeight - $T.SentWeight)) 'DIAG' 'Magenta'
+                    $T.WarnedWeight = $T.SteadyWeight
+                }
+
                 # A deck that never returns to empty leaves this terminal latched forever -- it
                 # captures one weighing and then goes silent, which looks identical to "no trucks
                 # today". Say so out loud rather than letting it disappear. Common causes: the
@@ -549,6 +571,7 @@ try {
                 Close-Socket $T.SdClient; $T.SdClient = $null
                 $T.SdFailures++
                 $T.NextSdRetryAt = $now.AddMilliseconds((Get-Backoff $T.SdFailures))
+                $T.SettleSince = $null     # unobserved time must not count toward settling
                 continue
             }
 
@@ -569,37 +592,40 @@ try {
 
             if ($overCapacity -eq '1' -or $underZero -eq '1') {
                 Write-Log "$($T.Name): refusing -- over capacity=$overCapacity under zero=$underZero" 'WARN' 'Yellow'
-                $T.StableCount = 0
+                $T.SettleSince = $null
                 continue
             }
+
+            # Settled = every reading for SettleSeconds within SettleTolerance of the others. A long
+            # window, not a few reads: trucks stop part-way on the deck while lining up, and wx0131
+            # reads "not moving" during that pause. On 2026-09-15 three reads in a row sent 9020
+            # for a JV Scale OUT truck that then stood at 13700. The tolerance lets a wobble of a
+            # division or two (13700 / 13780 on the same truck) through without restarting the wait.
+            if ($null -eq $T.SettleSince -or
+                ([Math]::Max($T.SettleMax, $gross) - [Math]::Min($T.SettleMin, $gross)) -gt $SettleTolerance) {
+                if ($null -ne $T.SettleSince) { Write-Verbose "$($T.Name): weight moved to $gross, settle timer restarted" }
+                $T.SettleSince = $now; $T.SettleMin = $gross; $T.SettleMax = $gross
+                continue
+            }
+            $T.SettleMin = [Math]::Min($T.SettleMin, $gross)
+            $T.SettleMax = [Math]::Max($T.SettleMax, $gross)
 
             # wx0131 == '0' means NOT moving. This is the comparison to never get backwards.
-            if ($motion -ne '0') {
-                if ($T.StableCount -gt 0) { Write-Verbose "$($T.Name): moved again, stability reset" }
-                $T.StableCount = 0
-                $T.LastStableWeight = $null
-                continue
-            }
-
-            # Not moving. The weight must also be unchanged across consecutive reads -- wx0131 can
-            # flicker to 0 for a single sample mid-roll.
-            if ($null -ne $T.LastStableWeight -and $T.LastStableWeight -eq $gross) {
-                $T.StableCount++
-            } else {
-                $T.StableCount = 1
-            }
-            $T.LastStableWeight = $gross
-
-            if ($T.StableCount -lt $SettleReads) { continue }
+            # Required on the reading we send, not on every reading in the window.
+            $settledFor = ($now - $T.SettleSince).TotalSeconds
+            if ($settledFor -lt $SettleSeconds -or $motion -ne '0') { continue }
 
             # -- settled --------------------------------------------------------------------
-            Set-State $T 'CAPTURED' "settled at $gross $unit after $($T.StableCount) stable reads"
+            Set-State $T 'CAPTURED' ("settled at $gross $unit -- held {0}-{1} for {2:N0}s" -f $T.SettleMin, $T.SettleMax, $settledFor)
+            Write-Log ("$($T.Name): capture detail -- 1701 reply '{0}' (gross {1}, net {2}, unit {3}, motion {4}); port {5} at the same moment '{6}' = {7}" -f `
+                $T.LastSdReply, $gross, $v[1], $unit, $motion, $StreamPort, $T.LastStreamLine, $T.LastStreamWeight) 'DIAG' 'DarkCyan'
+            $T.SentWeight = $gross
             $T.CapturedAt = Get-Date
             $payload = New-Payload -T $T -Weight $gross -Unit $unit
             # Do not count a dry run as sent -- "sent 3" in a heartbeat nobody posted is worse
             # than no number at all.
             if (Send-ToFlow $payload) { if (-not $DryRun) { $script:SentTotal++ } } else { Add-ToQueue $payload }
-            $T.StableCount = 0
+            $T.SettleSince = $null
         }
 
         if (((Get-Date) - $lastQueueRetry).TotalSeconds -ge $QueueRetrySecs) {
