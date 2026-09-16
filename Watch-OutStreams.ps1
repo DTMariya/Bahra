@@ -1,7 +1,7 @@
 # Live view of port 8000 on both OUT terminals. Read-only: sends nothing. Ctrl+C to stop.
 $port      = 8000
 $terminals = @(
-    @{ Name = 'JV Scale OUT';   Host = '192.168.104.52' },
+    @{ Name = 'JV Scale OUT';   Host = '192.168.104.51' },   # .51 is OUT, .52 is IN (Bahra, 2026-09-16)
     @{ Name = 'South Gate OUT'; Host = '192.168.174.12' }
 )
 $showEveryLine = $false   # $true = print all ~20 lines/sec, like PuTTY. $false = only when the reading changes.
