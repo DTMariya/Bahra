@@ -16,11 +16,20 @@
       IDLE      deck empty (|weight| < EmptyDeadband). Nothing to do.
       OCCUPIED  something on the deck. Poll 1701 every PollIntervalMs.
       CAPTURED  every reading for SettleSeconds stayed within SettleTolerance, and wx0131 says
-                "not moving". Posted once, then latched.
-      (back to IDLE when the deck clears, which clears the latch)
+                "not moving". Posted, then watched for a corrected weight.
+      (back to IDLE when the deck clears)
 
-    The latch is the point. A truck sits still for a minute while paperwork happens; without it
-    that is 200 identical rows.
+    Posting once is not enough. The weight the gate office writes down is the one AFTER the driver
+    climbs out of the cab -- a driver is around 80 kg, so the first settled weight is the wrong
+    one. While a truck stays on the deck the agent therefore keeps watching port 8000, and when
+    the deck holds a new weight for UpdateSteadySeconds it re-reads 1701 and posts an update:
+
+      a DROP over ChangeThreshold          the driver got down. This is the number that counts.
+      a RISE over MajorIncrease            we captured while the truck was only part-way on.
+      a rise smaller than that             the driver climbing back in. Ignored deliberately,
+                                           or the last thing sent would be the driver-in weight.
+
+    Downstream must keep the LATEST reading for a truck (highest "sequence"), not the first.
 
     wx0131 is Motion, not "settled": 0 = No, 1 = Yes (Shared Data Reference p24, and section
     2.2.1.2 p38 -- "a measure of whether the weight has settled on the scale"). We send when it
@@ -74,6 +83,10 @@ $SdPassword       = [string](Get-Setting 'password' '')
 $EmptyDeadband    = [double](Get-Setting 'emptyDeadband' 100)
 $SettleSeconds    = [double](Get-Setting 'settleSeconds' 30)
 $SettleTolerance  = [double](Get-Setting 'settleTolerance' 200)
+$ChangeThreshold  = [double](Get-Setting 'changeThreshold' 40)
+$UpdateSteadySecs = [double](Get-Setting 'updateSteadySeconds' 15)
+$MajorIncrease    = [double](Get-Setting 'majorIncreaseKg' 500)
+$MaxUpdates       = [int](Get-Setting 'maxUpdatesPerTruck' 4)
 $PollIntervalMs   = [int](Get-Setting 'pollIntervalMs' 300)
 $MaxWeighingSecs  = [int](Get-Setting 'maxWeighingSeconds' 300)
 $UtcOffsetHours   = [double](Get-Setting 'utcOffsetHours' 3)
@@ -325,8 +338,9 @@ function Get-StreamWeight {
 
 # ---------------------------------------------------------------------------- posting
 function New-Payload {
-    param($T, [double]$Weight, [string]$Unit)
+    param($T, [double]$Weight, [string]$Unit, [int]$Sequence = 1)
     return [ordered]@{
+        sequence  = $Sequence     # 1 = first post for this truck, 2+ = a corrected weight
         gate      = [int]$T.Gate
         direction = [int]$T.Direction
         weight    = $Weight
@@ -354,6 +368,41 @@ function Send-ToFlow {
         Write-Log "POST failed: $($_.Exception.Message)" 'WARN' 'Yellow'
         return $false
     }
+}
+
+function Read-Terminal {
+    <#
+        One authoritative 1701 read. Throws if the socket is bad -- the caller drops the connection
+        and reconnects. Returns $null for a reply that arrived but made no sense, which is not
+        worth a reconnect.
+    #>
+    param($T)
+    $v = Invoke-SdRead $T 'wt0101 wt0102 wt0103 wx0131 wx0133 wx0134'
+    if ($v.Count -lt 6) {
+        Write-Log "$($T.Name): short reply, got $($v.Count) values" 'WARN' 'Yellow'
+        return $null
+    }
+    $g = 0.0
+    if (-not [double]::TryParse($v[0], [ref]$g)) {
+        Write-Log "$($T.Name): unparseable gross '$($v[0])'" 'WARN' 'Yellow'
+        return $null
+    }
+    return @{
+        Gross = $g; Net = $v[1]; Unit = $v[2]
+        Motion = $v[3]      # wx0131  0 = No, 1 = Yes
+        Over = $v[4]        # wx0133
+        Under = $v[5]       # wx0134
+    }
+}
+
+function Send-Reading {
+    param($T, [double]$Weight, [string]$Unit)
+    $T.Sequence++
+    $payload = New-Payload -T $T -Weight $Weight -Unit $Unit -Sequence $T.Sequence
+    # Do not count a dry run as sent -- "sent 3" in a heartbeat nobody posted is worse than no
+    # number at all.
+    if (Send-ToFlow $payload) { if (-not $DryRun) { $script:SentTotal++ } } else { Add-ToQueue $payload }
+    $T.SentWeight = $Weight
 }
 
 function Add-ToQueue {
@@ -400,8 +449,8 @@ foreach ($t in $cfg.terminals) {
 
         # Diagnostics only -- none of these change what is sent.
         LastStreamLine = ''; LastSdReply = ''
-        SentWeight = $null; PeakWeight = 0.0
-        SteadyWeight = $null; SteadySince = $null; WarnedWeight = $null
+        SentWeight = $null; PeakWeight = 0.0; Sequence = 0; Updates = 0
+        SteadyWeight = $null; SteadySince = $null; PlateauDone = $null
 
         StreamFailures = 0; SdFailures = 0
         NextStreamRetryAt = [datetime]::MinValue
@@ -484,17 +533,21 @@ try {
                 }
             }
 
-            # How long port 8000 has shown the same weight. Diagnostics only.
-            if ($T.SteadyWeight -ne $T.LastStreamWeight) { $T.SteadyWeight = $T.LastStreamWeight; $T.SteadySince = $now }
+            # How long port 8000 has held one weight, give or take ChangeThreshold. This is what
+            # spots the driver climbing out, and it costs nothing -- the stream is free.
+            if ($null -eq $T.SteadySince -or [Math]::Abs($T.LastStreamWeight - $T.SteadyWeight) -gt $ChangeThreshold) {
+                $T.SteadyWeight = $T.LastStreamWeight; $T.SteadySince = $now
+            }
 
             $occupied = ([Math]::Abs($T.LastStreamWeight) -ge $EmptyDeadband)
 
             # -- IDLE ----------------------------------------------------------------------
             if (-not $occupied) {
                 if ($T.State -ne 'IDLE') {
-                    Write-Log ("$($T.Name): truck gone -- sent {0}, highest on deck {1}" -f `
-                        $(if ($null -ne $T.SentWeight) { $T.SentWeight } else { 'nothing' }), $T.PeakWeight) 'DIAG' 'DarkCyan'
-                    $T.SentWeight = $null; $T.PeakWeight = 0.0; $T.WarnedWeight = $null
+                    Write-Log ("$($T.Name): truck gone -- last sent {0} ({1} update(s)), highest on deck {2}" -f `
+                        $(if ($null -ne $T.SentWeight) { $T.SentWeight } else { 'nothing' }), $T.Updates, $T.PeakWeight) 'DIAG' 'DarkCyan'
+                    $T.SentWeight = $null; $T.PeakWeight = 0.0; $T.PlateauDone = $null
+                    $T.Sequence = 0; $T.Updates = 0
                     Set-State $T 'IDLE' "deck clear ($($T.LastStreamWeight))"
                     $T.SettleSince = $null
                     $T.OccupiedSince = $null
@@ -512,31 +565,9 @@ try {
             }
             if ($T.LastStreamWeight -gt $T.PeakWeight) { $T.PeakWeight = $T.LastStreamWeight }
 
-            # Already sent for this truck; wait for it to leave.
-            if ($T.State -eq 'CAPTURED') {
-                # Say so if the deck has since settled on a clearly different weight than the one
-                # we sent -- an early capture (truck paused part-way on) or 1701 disagreeing with
-                # the display. Logged once per steady value.
-                $steadyFor = ($now - $T.SteadySince).TotalSeconds
-                if ($null -ne $T.SentWeight -and $steadyFor -ge 3 -and $T.WarnedWeight -ne $T.SteadyWeight -and
-                    [Math]::Abs($T.SteadyWeight - $T.SentWeight) -gt $SettleTolerance) {
-                    Write-Log ("$($T.Name): MISMATCH -- sent {0} but port {1} has read {2} steadily for {3:N0}s (difference {4})" -f `
-                        $T.SentWeight, $StreamPort, $T.SteadyWeight, $steadyFor, ($T.SteadyWeight - $T.SentWeight)) 'DIAG' 'Magenta'
-                    $T.WarnedWeight = $T.SteadyWeight
-                }
-
-                # A deck that never returns to empty leaves this terminal latched forever -- it
-                # captures one weighing and then goes silent, which looks identical to "no trucks
-                # today". Say so out loud rather than letting it disappear. Common causes: the
-                # bridge needs re-zeroing, or something is parked on it.
-                if ($null -ne $T.CapturedAt -and ((Get-Date) - $T.CapturedAt).TotalMinutes -ge $StuckCapturedMins) {
-                    Write-Log ("$($T.Name): STILL LATCHED after $StuckCapturedMins min -- deck reads $($T.LastStreamWeight) and has not cleared, so no further weighing can be captured here. Check the bridge is empty and zeroed, or raise emptyDeadband.") 'ALARM' 'Red'
-                    $T.CapturedAt = Get-Date    # re-arm the warning rather than repeating every loop
-                }
-                continue
-            }
-
             # -- keep the shared data socket up --------------------------------------------
+            # Above the latch, because a captured truck still needs 1701 to confirm a corrected
+            # weight once the driver is out.
             if ($null -eq $T.SdClient -and $now -ge $T.NextSdRetryAt) {
                 try {
                     Connect-SharedData $T
@@ -553,6 +584,57 @@ try {
             }
             if ($null -eq $T.SdClient) { continue }
 
+            # Sent once for this truck. Watch for the weight that actually counts.
+            if ($T.State -eq 'CAPTURED') {
+                $steadyFor = ($now - $T.SteadySince).TotalSeconds
+                $delta     = $T.SteadyWeight - $T.SentWeight
+
+                if ($null -ne $T.SentWeight -and $steadyFor -ge $UpdateSteadySecs -and
+                    [Math]::Abs($delta) -gt $ChangeThreshold -and $T.PlateauDone -ne $T.SteadyWeight) {
+
+                    $T.PlateauDone = $T.SteadyWeight     # handle each new plateau once
+
+                    if ($delta -gt 0 -and $delta -le $MajorIncrease) {
+                        # Someone got back on. Sending this would replace the driver-out weight
+                        # with the driver-in one, which is the number we are trying to avoid.
+                        Write-Log ("$($T.Name): deck rose to {0} (+{1}) after sending {2} -- someone getting back on, not a load change. Left alone." -f `
+                            $T.SteadyWeight, $delta, $T.SentWeight) 'DIAG' 'DarkCyan'
+                    } elseif ($T.Updates -ge $MaxUpdates) {
+                        Write-Log ("$($T.Name): deck now holds {0} but $MaxUpdates update(s) already sent for this truck -- not sending again." -f $T.SteadyWeight) 'WARN' 'Yellow'
+                    } else {
+                        $why = if ($delta -lt 0) { "driver out / load off" } else { "was only part-way on" }
+                        try { $r = Read-Terminal $T } catch {
+                            Write-Log "$($T.Name): 1701 read failed ($($_.Exception.Message))" 'WARN' 'Yellow'
+                            Close-Socket $T.SdClient; $T.SdClient = $null
+                            $T.SdFailures++
+                            $T.NextSdRetryAt = $now.AddMilliseconds((Get-Backoff $T.SdFailures))
+                            $T.PlateauDone = $null       # try this plateau again once reconnected
+                            $r = $null
+                        }
+                        if ($null -ne $r -and $r.Motion -eq '0' -and $r.Over -ne '1' -and $r.Under -ne '1' -and
+                            [Math]::Abs($r.Gross - $T.SentWeight) -gt $ChangeThreshold) {
+                            $T.Updates++
+                            Write-Log ("$($T.Name): CORRECTION -- deck held {0} for {1:N0}s ({2}); sent {3}, now sending {4}" -f `
+                                $T.SteadyWeight, $steadyFor, $why, $T.SentWeight, $r.Gross) 'STATE' 'Cyan'
+                            Send-Reading -T $T -Weight $r.Gross -Unit $r.Unit
+                        } elseif ($null -ne $r) {
+                            Write-Log ("$($T.Name): port 8000 moved to {0} but 1701 says gross {1}, motion {2} -- not sending" -f `
+                                $T.SteadyWeight, $r.Gross, $r.Motion) 'DIAG' 'DarkCyan'
+                        }
+                    }
+                }
+
+                # A deck that never returns to empty leaves this terminal latched forever -- it
+                # captures one weighing and then goes silent, which looks identical to "no trucks
+                # today". Say so out loud rather than letting it disappear. Common causes: the
+                # bridge needs re-zeroing, or something is parked on it.
+                if ($null -ne $T.CapturedAt -and ((Get-Date) - $T.CapturedAt).TotalMinutes -ge $StuckCapturedMins) {
+                    Write-Log ("$($T.Name): STILL LATCHED after $StuckCapturedMins min -- deck reads $($T.LastStreamWeight) and has not cleared, so no further weighing can be captured here. Check the bridge is empty and zeroed, or raise emptyDeadband.") 'ALARM' 'Red'
+                    $T.CapturedAt = Get-Date    # re-arm the warning rather than repeating every loop
+                }
+                continue
+            }
+
             # -- give up on a truck that never settles --------------------------------------
             if (-not $T.GaveUp -and $null -ne $T.OccupiedSince -and ($now - $T.OccupiedSince).TotalSeconds -gt $MaxWeighingSecs) {
                 Write-Log "$($T.Name): on deck ${MaxWeighingSecs}s without settling -- not sending. Deck must clear before the next attempt." 'WARN' 'Yellow'
@@ -565,7 +647,7 @@ try {
             $T.LastPollAt = $now
 
             try {
-                $v = Invoke-SdRead $T 'wt0101 wt0102 wt0103 wx0131 wx0133 wx0134'
+                $r = Read-Terminal $T
             } catch {
                 Write-Log "$($T.Name): 1701 read failed ($($_.Exception.Message))" 'WARN' 'Yellow'
                 Close-Socket $T.SdClient; $T.SdClient = $null
@@ -574,24 +656,13 @@ try {
                 $T.SettleSince = $null     # unobserved time must not count toward settling
                 continue
             }
+            if ($null -eq $r) { continue }
 
-            if ($v.Count -lt 6) {
-                Write-Log "$($T.Name): short reply, got $($v.Count) values" 'WARN' 'Yellow'
-                continue
-            }
+            $gross = $r.Gross
+            $unit  = $r.Unit
 
-            $gross = 0.0
-            if (-not [double]::TryParse($v[0], [ref]$gross)) {
-                Write-Log "$($T.Name): unparseable gross '$($v[0])'" 'WARN' 'Yellow'
-                continue
-            }
-            $unit         = $v[2]
-            $motion       = $v[3]      # wx0131  0 = No, 1 = Yes
-            $overCapacity = $v[4]      # wx0133
-            $underZero    = $v[5]      # wx0134
-
-            if ($overCapacity -eq '1' -or $underZero -eq '1') {
-                Write-Log "$($T.Name): refusing -- over capacity=$overCapacity under zero=$underZero" 'WARN' 'Yellow'
+            if ($r.Over -eq '1' -or $r.Under -eq '1') {
+                Write-Log "$($T.Name): refusing -- over capacity=$($r.Over) under zero=$($r.Under)" 'WARN' 'Yellow'
                 $T.SettleSince = $null
                 continue
             }
@@ -613,18 +684,15 @@ try {
             # wx0131 == '0' means NOT moving. This is the comparison to never get backwards.
             # Required on the reading we send, not on every reading in the window.
             $settledFor = ($now - $T.SettleSince).TotalSeconds
-            if ($settledFor -lt $SettleSeconds -or $motion -ne '0') { continue }
+            if ($settledFor -lt $SettleSeconds -or $r.Motion -ne '0') { continue }
 
             # -- settled --------------------------------------------------------------------
             Set-State $T 'CAPTURED' ("settled at $gross $unit -- held {0}-{1} for {2:N0}s" -f $T.SettleMin, $T.SettleMax, $settledFor)
             Write-Log ("$($T.Name): capture detail -- 1701 reply '{0}' (gross {1}, net {2}, unit {3}, motion {4}); port {5} at the same moment '{6}' = {7}" -f `
-                $T.LastSdReply, $gross, $v[1], $unit, $motion, $StreamPort, $T.LastStreamLine, $T.LastStreamWeight) 'DIAG' 'DarkCyan'
-            $T.SentWeight = $gross
+                $T.LastSdReply, $gross, $r.Net, $unit, $r.Motion, $StreamPort, $T.LastStreamLine, $T.LastStreamWeight) 'DIAG' 'DarkCyan'
             $T.CapturedAt = Get-Date
-            $payload = New-Payload -T $T -Weight $gross -Unit $unit
-            # Do not count a dry run as sent -- "sent 3" in a heartbeat nobody posted is worse
-            # than no number at all.
-            if (Send-ToFlow $payload) { if (-not $DryRun) { $script:SentTotal++ } } else { Add-ToQueue $payload }
+            $T.PlateauDone = $T.SteadyWeight    # the plateau we just sent is not a correction
+            Send-Reading -T $T -Weight $gross -Unit $unit
             $T.SettleSince = $null
         }
 
