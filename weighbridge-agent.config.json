@@ -11,7 +11,15 @@
   "_emptyDeadband": "Confirmed non-zero decks on these bridges, and 1701 read -20 on an empty one. 100 kg is the starting point; raise it if the dry run shows OCCUPIED with no truck present.",
   "emptyDeadband": 100,
 
-  "settleReads": 3,
+  "_settle": "Send only after every reading for settleSeconds stays within settleTolerance (kg), and wx0131 reads not-moving. 2026-09-15: the old 3-read rule sent 9020 for a truck that stood at 13700.",
+  "settleSeconds": 30,
+  "settleTolerance": 200,
+
+  "_corrections": "2026-09-16: the gate office writes down the weight AFTER the driver climbs out (~80 kg). While a truck is on the deck the agent watches port 8000; a new weight held for updateSteadySeconds is re-read on 1701 and posted again with a higher sequence. A DROP over changeThreshold is the driver getting out. A RISE must exceed majorIncreaseKg to count, so the driver climbing back in is ignored. The flow must keep the LATEST sequence per truck.",
+  "changeThreshold": 40,
+  "updateSteadySeconds": 15,
+  "majorIncreaseKg": 500,
+  "maxUpdatesPerTruck": 4,
   "pollIntervalMs": 300,
   "maxWeighingSeconds": 300,
 
@@ -33,9 +41,10 @@
   "queuePath": "queue",
 
   "_terminals": "crce2_gate: 832200001 = jv scale, 832200000 = south. crce2_bounded: 832200000 = In, 832200001 = Out. The two columns are ordered OPPOSITE to each other.",
+  "_terminals_swapped": "2026-09-16, Bahra: the two JV addresses were the wrong way round. .51 is the OUT scale and .52 is the IN scale. Readings before this date carry the opposite direction.",
   "terminals": [
-    { "name": "JV Scale IN",    "host": "192.168.104.51", "gate": 832200001, "direction": 832200000 },
-    { "name": "JV Scale OUT",   "host": "192.168.104.52", "gate": 832200001, "direction": 832200001 },
+    { "name": "JV Scale OUT",   "host": "192.168.104.51", "gate": 832200001, "direction": 832200001 },
+    { "name": "JV Scale IN",    "host": "192.168.104.52", "gate": 832200001, "direction": 832200000 },
     { "name": "South Gate OUT", "host": "192.168.174.12", "gate": 832200000, "direction": 832200001 }
   ],
 
