@@ -1,1 +1,18 @@
-Copy-Item 'C:\weighbridge' 'C:\weighbridge-backup-20260929' -Recurse
+Disable-ScheduledTask -TaskName 'WeighbridgeAgent'
+Stop-ScheduledTask    -TaskName 'WeighbridgeAgent'
+Start-Sleep -Seconds 5
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Select-Object ProcessId, CommandLine | Format-List
+
+
+Move-Item 'C:\weighbridge\deploy\*' 'C:\weighbridge\' -Force
+Remove-Item 'C:\weighbridge\deploy'
+Get-ChildItem 'C:\weighbridge' | Select-Object Name, Length, LastWriteTime
+
+
+(Get-Content 'C:\weighbridge\weighbridge-agent.config.json' -Raw | ConvertFrom-Json).dataverseUrl
+
+
+cd C:\weighbridge
+& '.\Start-WeighbridgeAgent.ps1' -DryRun -Verbose
+
+& 'C:\weighbridge\Install-WeighbridgeTask.ps1'
