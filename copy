@@ -1,3 +1,1 @@
-Get-ScheduledTask -TaskName 'WeighbridgeAgent*' | Select-Object TaskName, State
-Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Select-Object ProcessId, CommandLine | Format-List
-Get-ChildItem 'C:\weighbridge'
+Copy-Item 'C:\weighbridge' 'C:\weighbridge-backup-20260929' -Recurse
