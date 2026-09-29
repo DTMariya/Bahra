@@ -1,6 +1,3 @@
-6WA8Q~wP9j14rya6-0v7BTV_Tl6VlxZ6lVAIwauM
-
-
-'192.168.104.51','192.168.104.52','192.168.174.12','192.168.174.13' | ForEach-Object {
-    "$_  1701=$((Test-NetConnection $_ -Port 1701 -WarningAction SilentlyContinue).TcpTestSucceeded)  8000=$((Test-NetConnection $_ -Port 8000 -WarningAction SilentlyContinue).TcpTestSucceeded)"
-}
+Get-ScheduledTask -TaskName 'WeighbridgeAgent*' | Select-Object TaskName, State
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Select-Object ProcessId, CommandLine | Format-List
+Get-ChildItem 'C:\weighbridge'
